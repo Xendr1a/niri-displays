@@ -2,6 +2,16 @@
 
 Inspect connected outputs and make temporary display changes directly from Noctalia. The plugin uses Niri's IPC to expose per-output enable/disable, resolution, refresh-rate, scale, rotation (transform), position, and focused-output state.
 
+## Screenshots
+
+Default panel — connection behavior, presets, and per-output controls:
+
+![Panel](images/panel.png)
+
+Expanded layout editor with the output map:
+
+![Layout](images/panel-layout.png)
+
 ## Plugin
 
 | Field | Value |
