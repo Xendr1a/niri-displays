@@ -1,7 +1,7 @@
 id = "xendr1a/niri-displays"
 name = "Niri 显示器"
 version = "0.10.0"
-plugin_api = 14
+plugin_api = 42
 author = "xendr1a"
 license = "MIT"
 dependencies = ["niri"]
@@ -71,9 +71,10 @@ scroll_down = "brightness-down"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-# 面板尺寸：单屏卡片两列排布后高度需求降低，宽度保留 680 供双卡并排
+# 面板尺寸：高度随内容自适应（content），封顶 900 防超高；宽度固定 680 供双卡并排
 width = 680
-height = 640
+height = "content"
+max_height = 900
 placement = "floating"
 position = "top_right"
 open_near_click = false
