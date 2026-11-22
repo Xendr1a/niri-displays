@@ -12,6 +12,10 @@ Expanded layout editor with the output map:
 
 ![Layout](images/panel-layout.png)
 
+Bar widget (the monitor glyph between volume and battery):
+
+![Bar widget](images/bar-widget.png)
+
 ## Plugin
 
 | Field | Value |
