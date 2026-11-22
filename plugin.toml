@@ -1,0 +1,79 @@
+id = "xendr1a/niri-displays"
+name = "Niri 显示器"
+version = "0.10.0"
+plugin_api = 14
+author = "xendr1a"
+license = "MIT"
+dependencies = ["niri"]
+tags = ["bar", "niri", "panel", "service", "system", "utility"]
+icon = "device-desktop"
+description = "开关 Niri 输出，调整分辨率、刷新率、缩放、旋转、VRR 和位置；尺寸变化后自动保持相邻屏位置；接上外接屏时可自动把焦点跟过去、并关掉笔记本内屏。改动写回 ~/.config/niri/outputs.kdl（被 config.kdl include），重启后保持。基于 raycursive/niri-displays 0.5.0 修改。"
+
+[[setting]]
+key = "scale_presets"
+type = "string_list"
+label_key = "settings.scale_presets.label"
+description_key = "settings.scale_presets.description"
+default = []
+
+[[setting]]
+key = "refresh_interval"
+type = "int"
+label_key = "settings.refresh_interval.label"
+description_key = "settings.refresh_interval.description"
+default = 30
+min = 5
+max = 300
+
+[[setting]]
+key = "outputs_file"
+type = "string"
+label_key = "settings.outputs_file.label"
+description_key = "settings.outputs_file.description"
+default = "~/.config/niri/outputs.kdl"
+
+[[service]]
+id = "displays"
+entry = "service.luau"
+
+# 控制中心瓷砖：点一下打开显示器面板（设置 → 控制中心快捷方式里添加）
+[[shortcut]]
+id = "shortcut"
+entry = "shortcut.luau"
+
+[[shortcut]]
+id = "preset-cycle"
+entry = "shortcut-cycle.luau"
+
+[[widget]]
+id = "bar"
+entry = "bar.luau"
+
+# 栏图标的手势：左键开面板（脚本里的 onClick），滚轮调亮度，右键回落内置「屏幕」页。
+[widget.actions]
+right = "panel-toggle control-center monitor"
+scroll_up = "brightness-up"
+scroll_down = "brightness-down"
+
+  [[widget.setting]]
+  key = "glyph"
+  type = "glyph"
+  label_key = "settings.glyph.label"
+  default = "device-desktop"
+
+  [[widget.setting]]
+  key = "show_resolution"
+  type = "bool"
+  label_key = "settings.show_resolution.label"
+  description_key = "settings.show_resolution.description"
+  default = false
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+# 面板尺寸：高度比上游多 60，两张并排卡片加连接行为/布局区才不会被折在滚动区下面
+width = 680
+height = 720
+placement = "floating"
+position = "top_right"
+open_near_click = false
