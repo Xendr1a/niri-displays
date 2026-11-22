@@ -71,9 +71,9 @@ scroll_down = "brightness-down"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-# 面板尺寸：高度比上游多 60，两张并排卡片加连接行为/布局区才不会被折在滚动区下面
+# 面板尺寸：单屏卡片两列排布后高度需求降低，宽度保留 680 供双卡并排
 width = 680
-height = 720
+height = 640
 placement = "floating"
 position = "top_right"
 open_near_click = false
