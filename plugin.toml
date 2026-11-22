@@ -71,8 +71,8 @@ scroll_down = "brightness-down"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-# 面板尺寸：高度随内容自适应（content），封顶 900 防超高；宽度固定 680 供双卡并排
-width = 680
+# 面板尺寸：高度随内容自适应（content），封顶 900 防超高；宽度 600 供双卡并排
+width = 600
 height = "content"
 max_height = 900
 placement = "floating"
