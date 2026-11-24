@@ -1,15 +1,27 @@
 {
   "error": {
     "command": "niri 拒绝了这次显示设置。",
+    "layout_write": "无法写入显示器布局。",
+    "layout_unmanaged": "现有布局文件并非由此插件生成，已保留原文件。请在插件设置中指定专用布局文件。",
+    "layout_invalid": "生成的显示器布局未通过 niri 校验。",
+    "layout_changed": "布局文件在校验期间发生变更，已保留最新内容。",
     "mode_missing": "该分辨率没有可用的刷新率。",
     "niri_missing": "在 PATH 里找不到 niri 可执行文件。",
     "outputs": "无法从 niri 读取输出设备。",
     "parse_outputs": "niri 返回的输出数据无法解析。",
+    "preset_enable": "目标显示器仍处于关闭状态。",
+    "preset_incomplete": "显示器状态与所选预设不一致。",
+    "preset_title": "无法应用显示器预设",
+    "preset_unavailable": "无法识别此显示器预设。",
     "timeout": "niri 没有及时响应。",
     "title": "读不到 niri 的显示器信息"
   },
   "policy": {
-    "failed": "显示器策略执行失败"
+    "failed": "显示器策略执行失败",
+    "focus_output": "将焦点移到 {port}",
+    "restore_internal": "恢复内置屏",
+    "turn_internal_off": "关闭内置屏",
+    "turn_internal_on": "打开内置屏"
   },
   "panel": {
     "apply": "应用",
@@ -29,13 +41,16 @@
     "policy_focus_external_hint": "开机或插上外接屏时，焦点跟过去一次",
     "policy_internal_off": "接上外接屏时关闭笔记本内屏",
     "policy_internal_off_hint": "外接屏亮着时关掉内屏，拔掉后自动恢复",
-    "policy_note": "存在 ~/.config/niri/displays-policy.json，跨开机保留。",
+    "policy_note": "策略保存在布局文件所在目录，重启后继续生效。",
     "refresh_rate": "刷新率",
     "resolution": "分辨率",
     "retry": "重试",
     "rotation": "旋转",
+    "rotation_mirrored": "镜像",
+    "rotation_mirrored_angle": "镜像 {angle}",
+    "rotation_normal": "正常",
     "subtitle": "调整已连接显示器的开关、分辨率、方向与布局",
-    "temporary_note": "改动立即生效，并自动写回 ~/.config/niri/outputs.kdl（不保存「关闭」状态）。",
+    "temporary_note": "改动立即生效，布局保存到 {path}。显示器开关仅在当前会话生效。",
     "updated": "更新于 {time}",
     "solo_all": "全部打开",
     "screen_title": "屏幕",
