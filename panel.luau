@@ -1,18 +1,17 @@
 --!nonstrict
--- Interactive Niri output controls. Niri's `msg output` API is intentionally
--- temporary: this plugin never edits the user's compositor configuration.
+-- Interactive Niri output controls. The service owns layout persistence.
 
 local MAX_DISPLAYS = 12
 local COMMAND_TIMEOUT_MS = 8000
 local TRANSFORM_OPTIONS = {
-  { value = "normal", text = "正常" },
+  { value = "normal", label = "panel.rotation_normal" },
   { value = "90", text = "90°" },
   { value = "180", text = "180°" },
   { value = "270", text = "270°" },
-  { value = "flipped", text = "镜像" },
-  { value = "flipped-90", text = "镜像 90°" },
-  { value = "flipped-180", text = "镜像 180°" },
-  { value = "flipped-270", text = "镜像 270°" },
+  { value = "flipped", label = "panel.rotation_mirrored" },
+  { value = "flipped-90", label = "panel.rotation_mirrored_angle", angle = "90°" },
+  { value = "flipped-180", label = "panel.rotation_mirrored_angle", angle = "180°" },
+  { value = "flipped-270", label = "panel.rotation_mirrored_angle", angle = "270°" },
 }
 local CENTERED_LAYOUT = { flexGrow = 1, align = "center", justify = "center", gap = 10, padding = 20 }
 
@@ -25,6 +24,7 @@ local snapshot = noctalia.state.get("display_snapshot") or {
 local isOpen = false
 local actionPending = false
 local actionError = ""
+local presetStatus = noctalia.state.get("preset_status") or {}
 local scaleDraft = {}
 local scaleEditing = {}
 local positionDraft = {}
@@ -72,6 +72,12 @@ local render
 
 local tr = noctalia.tr
 
+local function canChangeDisplays(current, currentPreset)
+  current = current or snapshot
+  currentPreset = currentPreset or presetStatus
+  return current.status == "ok" and not current.actions_pending and not actionPending and not currentPreset.pending
+end
+
 local function quoteShellArgument(value)
   return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
 end
@@ -97,12 +103,6 @@ local function syncFromState()
     lastEnabledByPort[display.port] = display.enabled
     if scaleDraft[display.port] == nil or (not actionPending and not scaleEditing[display.port]) then
       scaleDraft[display.port] = display.scale
-    end
-    if positionDraft[display.port] == nil then
-      positionDraft[display.port] = {
-        x = display.x,
-        y = display.y,
-      }
     end
   end
   for port, _ in pairs(scaleDraft) do
@@ -189,7 +189,7 @@ end
 local function optionsFromChoices(choices)
   local options = {}
   for _, choice in ipairs(choices) do
-    table.insert(options, choice.text)
+    table.insert(options, choice.text or tr(choice.label, { angle = choice.angle }))
   end
   return options
 end
@@ -246,11 +246,13 @@ local function bestRefresh(display, width, height)
   return choices[1].refresh_rate
 end
 
-local function runNiri(command)
-  if actionPending then
+local function runNiri(command, sessionOnly, onSuccess)
+  if noctalia.state.get("display_action_pending") == true
+    or not canChangeDisplays(noctalia.state.get("display_snapshot"), noctalia.state.get("preset_status")) then
     return
   end
   actionPending = true
+  noctalia.state.set("display_action_pending", true)
   actionError = ""
   noctalia.log("niri-displays: running " .. command)
   render()
@@ -259,36 +261,36 @@ local function runNiri(command)
     actionPending = false
     if result.exitCode ~= 0 then
       local message = noctalia.string.trim(result.stderr or ""):match("^[^\r\n]*") or ""
-      actionError = message ~= "" and message or tr("error.command")
+      actionError = result.timedOut and tr("error.timeout") or (message ~= "" and message or tr("error.command"))
+      noctalia.state.set("refresh_requested", (noctalia.state.get("refresh_requested") or 0) + 1)
     else
       noctalia.log("niri-displays: display change applied")
-      noctalia.state.set("refresh_requested", (noctalia.state.get("refresh_requested") or 0) + 1)
-      -- 让服务在拿到刷新后的快照时把布局写回 ~/.config/niri/outputs.kdl
-      noctalia.state.set("persist_requested", (noctalia.state.get("persist_requested") or 0) + 1)
+      if onSuccess ~= nil then
+        onSuccess()
+      end
+      local key = sessionOnly and "refresh_requested" or "persist_requested"
+      noctalia.state.set(key, (noctalia.state.get(key) or 0) + 1)
     end
+    noctalia.state.set("display_action_pending", false)
     render()
   end, COMMAND_TIMEOUT_MS)
   if not started then
     actionPending = false
+    noctalia.state.set("display_action_pending", false)
     actionError = tr("error.command")
     render()
   end
 end
 
-local function applyMode(display, width, height, refreshRate, automaticScale)
+local function applyMode(display, width, height, refreshRate)
   local command = "niri msg output " .. quoteShellArgument(display.port)
     .. " mode " .. quoteShellArgument(string.format("%dx%d@%.3f", width, height, refreshRate / 1000))
-  if automaticScale ~= nil then
-    command ..= " && niri msg output " .. quoteShellArgument(display.port)
-      .. " scale " .. quoteShellArgument(formatScale(automaticScale))
-    scaleDraft[display.port] = automaticScale
-  end
   runNiri(command)
 end
 
 local function changeResolution(display, choices, index)
   local choice = choices[index + 1]
-  if choice.width == display.width and choice.height == display.height then
+  if choice == nil or (choice.width == display.width and choice.height == display.height) then
     return
   end
   local refreshRate = bestRefresh(display, choice.width, choice.height)
@@ -297,16 +299,15 @@ local function changeResolution(display, choices, index)
     render()
     return
   end
-  local automaticScale = presetFor(display.port, choice.width, choice.height)
-  applyMode(display, choice.width, choice.height, refreshRate, automaticScale)
+  applyMode(display, choice.width, choice.height, refreshRate)
 end
 
 local function changeRefresh(display, choices, index)
   local choice = choices[index + 1]
-  if choice.refresh_rate == display.refresh_rate then
+  if choice == nil or choice.refresh_rate == display.refresh_rate then
     return
   end
-  applyMode(display, display.width, display.height, choice.refresh_rate, nil)
+  applyMode(display, display.width, display.height, choice.refresh_rate)
 end
 
 local function changeTransform(display, index)
@@ -338,44 +339,36 @@ end
 -- `niri msg output <port> on|off` is temporary like every other command here:
 -- the compositor config still decides the state after a reload.
 local function changeEnabled(display, on)
+  syncFromState()
+  if not on and enabledCount() <= 1 then
+    return
+  end
   local command = "niri msg output " .. quoteShellArgument(display.port)
     .. (on and " on" or " off")
-  runNiri(command)
+  runNiri(command, true)
 end
 
 -- 主屏 = 该输出带 focus-at-startup，重启 Niri 后工作区 1 落在它上面。
 -- 已启用的输出会在点星标时立刻 focus-monitor；关着的输出只落盘，不抢焦点。
 local function setPrimary(display)
+  if not canChangeDisplays() then
+    return
+  end
   primaryPort = display.port
   noctalia.state.set("primary_port", display.port)
   if display.enabled then
-    runNiri("niri msg action focus-monitor " .. quoteShellArgument(display.port))
+    runNiri("niri msg action focus-monitor " .. quoteShellArgument(display.port), true)
   else
-    noctalia.state.set("persist_requested", (noctalia.state.get("persist_requested") or 0) + 1)
     render()
   end
-end
-
--- 一键布局：solo = 只留当前焦点屏，all = 全部打开。用 niri IPC 自己实现，
--- 不依赖外部脚本，方便别人装。
-local function runSolo(mode)
-  local keep = snapshot.focused_output
-  local parts = {}
-  for _, display in ipairs(snapshot.displays) do
-    if mode == "all" then
-      if not display.enabled then
-        table.insert(parts, "niri msg output " .. quoteShellArgument(display.port) .. " on")
-      end
-    elseif display.enabled and display.port ~= keep then
-      table.insert(parts, "niri msg output " .. quoteShellArgument(display.port) .. " off")
-    end
-  end
-  if #parts > 0 then
-    runNiri(table.concat(parts, " && "))
-  end
+  noctalia.state.set("persist_requested", (noctalia.state.get("persist_requested") or 0) + 1)
 end
 
 local function changeScaleDraft(display, value)
+  value = tonumber(value)
+  if value == nil then
+    return
+  end
   scaleEditing[display.port] = true
   scaleDraft[display.port] = value
   render()
@@ -401,6 +394,13 @@ local function logicalArea(display)
   return size.width * size.height
 end
 
+local function selectLayoutOutput(port)
+  selectedPort = port
+  positionDraft = {}
+  layoutDirection = nil
+  layoutOffset = 0
+end
+
 local function defaultSelectedPort(displays)
   if selectedPort ~= nil then
     for _, display in ipairs(displays) do
@@ -422,7 +422,7 @@ local function defaultSelectedPort(displays)
       end
     end
   end
-  selectedPort = best and best.port or nil
+  selectLayoutOutput(best and best.port or nil)
   return selectedPort
 end
 
@@ -462,6 +462,10 @@ local function setDirection(display, ref, direction)
 end
 
 local function changeLayoutOffset(display, ref, value)
+  value = tonumber(value)
+  if value == nil then
+    return
+  end
   layoutOffset = value
   local direction = layoutDirection or "right"
   local x, y = snapPosition(display, ref, direction)
@@ -481,7 +485,11 @@ local function commitPosition(display)
   end
   local command = "niri msg output " .. quoteShellArgument(display.port)
     .. " position set -- " .. tostring(draft.x) .. " " .. tostring(draft.y)
-  runNiri(command)
+  runNiri(command, false, function()
+    positionDraft[display.port] = nil
+    layoutDirection = nil
+    layoutOffset = 0
+  end)
 end
 
 local MAP_WIDTH = 320
@@ -495,6 +503,10 @@ local function isRotatedSideways(transform)
 end
 
 displayLogicalSize = function(display)
+  if display.logical_width and display.logical_width > 0
+    and display.logical_height and display.logical_height > 0 then
+    return { width = display.logical_width, height = display.logical_height }
+  end
   local scale = display.scale > 0 and display.scale or 1
   local width = display.width / scale
   local height = display.height / scale
@@ -514,6 +526,9 @@ end
 
 -- 连接行为开关：面板只改共享状态，落盘和执行都由服务端做（面板不写文件）。
 local function setPolicy(key, value)
+  if not canChangeDisplays() then
+    return
+  end
   policy[key] = value == true
   local payload = {
     focus_external = policy.focus_external == true,
@@ -542,6 +557,7 @@ local function policySection()
       }),
       ui.toggle({
         checked = checked,
+        enabled = canChangeDisplays(),
         onChange = function(value)
           setPolicy(key, value == "true")
         end,
@@ -573,88 +589,13 @@ local function policySection()
   }, rows)
 end
 
--- 关闭的输出不报 mode，尺寸从首选模式回退，避免「双屏并排」把两块屏摆到同一坐标。
-local function modeLogicalSize(display)
-  if display.enabled and display.width > 0 and display.height > 0 then
-    return displayLogicalSize(display)
-  end
-  local mode = nil
-  for _, candidate in ipairs(display.modes or {}) do
-    if candidate.preferred then
-      mode = candidate
-      break
-    end
-  end
-  mode = mode or (display.modes or {})[1]
-  if mode == nil then
-    return { width = 0, height = 0 }
-  end
-  local scale = display.scale > 0 and display.scale or 1
-  local width, height = mode.width / scale, mode.height / scale
-  if isRotatedSideways(display.transform) then
-    return { width = height, height = width }
-  end
-  return { width = width, height = height }
-end
-
--- 纯函数：生成一键布局命令（或返回错误键），不执行。安全守卫在这里：
--- 目标集合为空时绝不生成「全关」命令，免得会话全黑。
-local function presetCommands(kind, displays)
-  local external, builtin = nil, nil
-  for _, display in ipairs(displays) do
-    if isBuiltinPort(display.port) then
-      builtin = builtin or display
-    else
-      external = external or display
-    end
-  end
-
-  local commands = {}
-  if kind == "dual" then
-    if external == nil or builtin == nil then
-      return nil, "panel.preset_need_two"
-    end
-    local extSize = modeLogicalSize(external)
-    if not external.enabled then
-      table.insert(commands, "niri msg output " .. quoteShellArgument(external.port) .. " on")
-    end
-    table.insert(commands, "niri msg output " .. quoteShellArgument(external.port) .. " position set -- 0 0")
-    if not builtin.enabled then
-      table.insert(commands, "niri msg output " .. quoteShellArgument(builtin.port) .. " on")
-    end
-    table.insert(commands, "niri msg output " .. quoteShellArgument(builtin.port)
-      .. " position set -- " .. tostring(math.floor(extSize.width + 0.5)) .. " 0")
-  else
-    local wantBuiltin = kind == "laptop"
-    if wantBuiltin and builtin == nil then
-      return nil, "panel.preset_need_builtin"
-    end
-    if not wantBuiltin and external == nil then
-      return nil, "panel.preset_need_external"
-    end
-    for _, display in ipairs(displays) do
-      local keep = isBuiltinPort(display.port) == wantBuiltin
-      if display.enabled ~= keep then
-        table.insert(commands, "niri msg output " .. quoteShellArgument(display.port) .. (keep and " on" or " off"))
-      end
-    end
-  end
-  return commands
-end
-
 local function applyPreset(kind)
-  if actionPending then
+  if not canChangeDisplays() then
     return
   end
-  local commands, errKey = presetCommands(kind, snapshot.displays)
-  if commands == nil then
-    actionError = tr(errKey)
-    render()
-    return
-  end
-  if #commands > 0 then
-    runNiri(table.concat(commands, " && "))
-  end
+  actionError = ""
+  noctalia.state.set("preset_kind", kind)
+  noctalia.state.set("preset_requested", (noctalia.state.get("preset_requested") or 0) + 1)
 end
 
 local function effectivePosition(display)
@@ -663,25 +604,6 @@ local function effectivePosition(display)
     return draft.x, draft.y
   end
   return display.x, display.y
-end
-
-local function layoutBounds(displays)
-  local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
-  local any = false
-  for _, display in ipairs(displays) do
-    if display.enabled and display.width > 0 and display.height > 0 then
-      local size = displayLogicalSize(display)
-      minX = math.min(minX, display.x)
-      minY = math.min(minY, display.y)
-      maxX = math.max(maxX, display.x + size.width)
-      maxY = math.max(maxY, display.y + size.height)
-      any = true
-    end
-  end
-  if not any then
-    return nil
-  end
-  return { minX = minX, minY = minY, maxX = maxX, maxY = maxY }
 end
 
 local function layoutMap(displays)
@@ -795,8 +717,7 @@ local function layoutMap(displays)
 end
 
 local function layoutSection(displays)
-  local bounds = layoutBounds(displays)
-  if bounds == nil then
+  if enabledCount() == 0 then
     return nil
   end
 
@@ -826,6 +747,7 @@ local function layoutSection(displays)
     return ui.column({ gap = 4, align = "stretch" }, { header })
   end
 
+  local targetPort = defaultSelectedPort(displays)
   local map = layoutMap(displays)
   local children = {}
 
@@ -840,8 +762,6 @@ local function layoutSection(displays)
     }, { map }))
   end
 
-  local targetPort = defaultSelectedPort(displays)
-
   -- 地图下方的端口按钮：点一下就把布局编辑目标切到这块屏。
   local targetButtons = {}
   for _, display in ipairs(displays) do
@@ -853,9 +773,7 @@ local function layoutSection(displays)
         fontSize = 10,
         onClick = function()
           if selectedPort ~= display.port then
-            selectedPort = display.port
-            layoutDirection = nil
-            layoutOffset = 0
+            selectLayoutOutput(display.port)
             savePanelUi()
             render()
           end
@@ -880,7 +798,7 @@ local function layoutSection(displays)
   if selected ~= nil then
     local ref = referenceDisplay(displays, selected.port)
     if ref ~= nil then
-      local canMove = not actionPending
+      local canMove = canChangeDisplays()
 
       local options = {}
       local optionPorts = {}
@@ -921,9 +839,7 @@ local function layoutSection(displays)
             onChange = function(index)
               local port = optionPorts[index + 1]
               if port ~= nil and port ~= selectedPort then
-                selectedPort = port
-                layoutDirection = nil
-                layoutOffset = 0
+                selectLayoutOutput(port)
                 savePanelUi()
                 render()
               end
@@ -1044,15 +960,8 @@ local function displayCard(display, position, compact)
   end
   local refreshes = refreshChoices(display, display.width, display.height)
 
-  local resolutionTexts, refreshTexts = {}, {}
-  for _, choice in ipairs(resolutions) do
-    table.insert(resolutionTexts, choice.text)
-  end
-  for _, choice in ipairs(refreshes) do
-    table.insert(refreshTexts, choice.text)
-  end
-
-  local enabled = display.enabled and not actionPending and #resolutions > 0
+  local canChange = canChangeDisplays()
+  local enabled = display.enabled and canChange
   -- Refuse to black out the session: the final lit output cannot be switched off.
   local isLastEnabled = display.enabled and enabledCount() <= 1
   local scale = scaleDraft[display.port] or display.scale
@@ -1086,6 +995,7 @@ local function displayCard(display, position, compact)
   table.insert(headerChildren, ui.button({
     glyph = isPrimary and "star-filled" or "star",
     selected = isPrimary,
+    enabled = canChange,
     tooltip = tr("panel.primary_hint"),
     onClick = function()
       setPrimary(display)
@@ -1108,14 +1018,14 @@ local function displayCard(display, position, compact)
   local transformOptions = optionsFromChoices(TRANSFORM_OPTIONS)
 
   local enabledSwitch = switchRow(tr(isLastEnabled and "panel.last_display" or "panel.enabled"), display.enabled,
-    not actionPending and not isLastEnabled,
+    canChange and not isLastEnabled,
     function(value)
       changeEnabled(display, value == "true")
     end)
   local resolutionField = field(tr("panel.resolution"), ui.select({
     options = resolutionOptions,
     selectedIndex = selectedResolutionIndex(display, resolutions),
-    enabled = enabled,
+    enabled = enabled and #resolutions > 0,
     onChange = function(index)
       changeResolution(display, resolutions, index)
     end,
@@ -1131,7 +1041,7 @@ local function displayCard(display, position, compact)
   local rotationField = field(tr("panel.rotation"), ui.select({
     options = transformOptions,
     selectedIndex = selectedTransformIndex(display),
-    enabled = display.enabled and not actionPending,
+    enabled = enabled,
     onChange = function(index)
       changeTransform(display, index)
     end,
@@ -1150,7 +1060,7 @@ local function displayCard(display, position, compact)
       max = maxScale,
       step = 0.05,
       value = scale,
-      enabled = display.enabled and not actionPending,
+      enabled = enabled,
       onChange = function(value)
         changeScaleDraft(display, value)
       end,
@@ -1160,7 +1070,7 @@ local function displayCard(display, position, compact)
     }),
   })
   local vrrSwitch = switchRow(tr("panel.vrr"), display.vrr_enabled,
-    display.enabled and not actionPending,
+    enabled,
     function(value)
       changeVrr(display, value == "true")
     end)
@@ -1316,20 +1226,22 @@ render = function()
     end
   end
 
+  local canChange = canChangeDisplays()
   table.insert(children, ui.row({ gap = 8, align = "center" }, {
     ui.button({
       text = tr("panel.solo_all"),
       flexGrow = 1,
       glyph = "layout-grid",
+      enabled = canChange and #snapshot.displays > 0,
       onClick = function()
-        runSolo("all")
+        applyPreset("all")
       end,
     }),
     ui.button({
       text = tr("panel.preset_laptop"),
       flexGrow = 1,
       glyph = "device-laptop",
-      enabled = hasBuiltin,
+      enabled = canChange and hasBuiltin,
       tooltip = not hasBuiltin and tr("panel.preset_need_builtin") or nil,
       onClick = function()
         applyPreset("laptop")
@@ -1339,7 +1251,7 @@ render = function()
       text = tr("panel.preset_external"),
       flexGrow = 1,
       glyph = "device-desktop",
-      enabled = hasExternal,
+      enabled = canChange and hasExternal,
       tooltip = not hasExternal and tr("panel.preset_need_external") or nil,
       onClick = function()
         applyPreset("external")
@@ -1349,7 +1261,7 @@ render = function()
       text = tr("panel.preset_dual"),
       flexGrow = 1,
       glyph = "layout-columns",
-      enabled = hasBuiltin and hasExternal,
+      enabled = canChange and hasBuiltin and hasExternal,
       tooltip = not (hasBuiltin and hasExternal) and tr("panel.preset_need_two") or nil,
       onClick = function()
         applyPreset("dual")
@@ -1366,6 +1278,11 @@ render = function()
   table.insert(children, body())
 
   -- 底部常驻说明条（第一版那种），把「立即生效 / 写回哪个文件」固定在一个位置。
+  local configuredPath = noctalia.getConfig("outputs_file")
+  local path = type(configuredPath) == "string" and noctalia.string.trim(configuredPath) or ""
+  if path == "" then
+    path = "~/.config/niri/outputs.kdl"
+  end
   table.insert(children, ui.row({
     gap = 8,
     align = "center",
@@ -1377,7 +1294,7 @@ render = function()
     radius = 10,
   }, {
     ui.glyph({ name = "info-circle", size = 13, color = "on_surface_variant" }),
-    ui.label({ text = tr("panel.temporary_note"), fontSize = 10, color = "on_surface_variant", flexGrow = 1, maxLines = 2 }),
+    ui.label({ text = tr("panel.temporary_note", { path = path }), fontSize = 10, color = "on_surface_variant", flexGrow = 1, maxLines = 2 }),
   }))
 
   panel.render(ui.column({ flexGrow = 1, gap = 5, align = "stretch" }, children))
@@ -1388,8 +1305,32 @@ noctalia.state.watch("display_snapshot", function()
   render()
 end)
 
+noctalia.state.watch("primary_port", function(value)
+  primaryPort = value
+  render()
+end)
+
+noctalia.state.watch("displays_policy", function()
+  syncFromState()
+  render()
+end)
+
+noctalia.state.watch("preset_status", function(value)
+  presetStatus = value or {}
+  if presetStatus.pending then
+    actionError = ""
+    layoutDirection = nil
+    layoutOffset = 0
+    positionDraft = {}
+  elseif presetStatus.error_message and presetStatus.error_message ~= "" then
+    actionError = presetStatus.error_message
+  end
+  render()
+end)
+
 function onOpen(_context)
   scaleEditing = {}
+  presetStatus = noctalia.state.get("preset_status") or {}
   loadPanelUi()
   syncFromState()
   isOpen = true
@@ -1400,7 +1341,16 @@ end
 function onClose()
   isOpen = false
   scaleEditing = {}
+  positionDraft = {}
+  layoutDirection = nil
+  layoutOffset = 0
   savePanelUi()
+end
+
+function onExit()
+  if actionPending then
+    noctalia.state.set("display_action_pending", false)
+  end
 end
 
 function onConfigChanged()

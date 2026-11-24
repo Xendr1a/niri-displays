@@ -1,79 +1,94 @@
 {
   "error": {
-    "command": "niri 拒绝了这次显示设置。",
-    "mode_missing": "该分辨率没有可用的刷新率。",
-    "niri_missing": "在 PATH 里找不到 niri 可执行文件。",
-    "outputs": "无法从 niri 读取输出设备。",
-    "parse_outputs": "niri 返回的输出数据无法解析。",
-    "timeout": "niri 没有及时响应。",
-    "title": "读不到 niri 的显示器信息"
+    "command": "Niri rejected this display change.",
+    "layout_write": "Could not save the display layout.",
+    "layout_unmanaged": "The plugin only replaces layout files it generated. Choose a dedicated layout file in the plugin settings.",
+    "layout_invalid": "The generated display layout failed Niri validation.",
+    "layout_changed": "The layout file changed during validation. The latest contents were preserved.",
+    "mode_missing": "This resolution has no available refresh rates.",
+    "niri_missing": "The niri executable was not found on PATH.",
+    "outputs": "Could not read display outputs from Niri.",
+    "parse_outputs": "Could not parse the output data from Niri.",
+    "preset_enable": "The target display is still off.",
+    "preset_incomplete": "The display state differs from the selected preset.",
+    "preset_title": "Could not apply the display preset",
+    "preset_unavailable": "Unknown display preset.",
+    "timeout": "Niri did not respond in time.",
+    "title": "Could not read Niri displays"
   },
   "policy": {
-    "failed": "显示器策略执行失败"
+    "failed": "Could not apply the display policy",
+    "focus_output": "Move focus to {port}",
+    "restore_internal": "Restore the built-in display",
+    "turn_internal_off": "Turn off the built-in display",
+    "turn_internal_on": "Turn on the built-in display"
   },
   "panel": {
-    "apply": "应用",
-    "disabled": "已关闭",
-    "empty": "niri 没有报告任何已连接的显示器。",
-    "enabled": "启用",
-    "focused": "当前焦点",
-    "last_display": "唯一亮着的屏",
-    "layout": "屏幕布局",
-    "loading": "正在从 niri 读取显示器…",
-    "more_displays": "…还有 {count} 个显示器",
-    "position": "位置",
-    "position_offset": "偏移",
-    "primary_hint": "主屏：立即聚焦，重启后仍保持",
-    "policy_title": "连接行为",
-    "policy_focus_external": "接上外接屏时焦点跟过去",
-    "policy_focus_external_hint": "开机或插上外接屏时，焦点跟过去一次",
-    "policy_internal_off": "接上外接屏时关闭笔记本内屏",
-    "policy_internal_off_hint": "外接屏亮着时关掉内屏，拔掉后自动恢复",
-    "policy_note": "存在 ~/.config/niri/displays-policy.json，跨开机保留。",
-    "refresh_rate": "刷新率",
-    "resolution": "分辨率",
-    "retry": "重试",
-    "rotation": "旋转",
-    "subtitle": "调整已连接显示器的开关、分辨率、方向与布局",
-    "temporary_note": "改动立即生效，并自动写回 ~/.config/niri/outputs.kdl（不保存「关闭」状态）。",
-    "updated": "更新于 {time}",
-    "solo_all": "全部打开",
-    "screen_title": "屏幕",
-    "preset_laptop": "只留笔记本",
-    "preset_external": "只留外接",
-    "preset_dual": "双屏并排",
-    "preset_need_two": "需要同时接着内置屏和外接屏",
-    "preset_need_builtin": "没有检测到笔记本内屏",
-    "preset_need_external": "没有检测到外接屏",
-    "vrr": "可变刷新率",
-    "scale_range": "缩放（0.5×–3×）"
+    "apply": "Apply",
+    "disabled": "Off",
+    "empty": "Niri reports no connected displays.",
+    "enabled": "Enabled",
+    "focused": "Focused",
+    "last_display": "Only active display",
+    "layout": "Display layout",
+    "loading": "Reading displays from Niri…",
+    "more_displays": "…and {count} more",
+    "position": "Position",
+    "position_offset": "Offset",
+    "primary_hint": "Set as primary at startup. Focuses the display if enabled.",
+    "policy_title": "Connection behavior",
+    "policy_focus_external": "Focus an external display",
+    "policy_focus_external_hint": "Move focus at startup or when an external display connects.",
+    "policy_internal_off": "Turn off the built-in display",
+    "policy_internal_off_hint": "Restore the built-in display when external displays disconnect.",
+    "policy_note": "These settings are saved alongside the layout file and persist after restart.",
+    "refresh_rate": "Refresh rate",
+    "resolution": "Resolution",
+    "retry": "Retry",
+    "rotation": "Rotation",
+    "rotation_mirrored": "Mirrored",
+    "rotation_mirrored_angle": "Mirrored {angle}",
+    "rotation_normal": "Normal",
+    "subtitle": "Adjust power, mode, orientation, and layout",
+    "temporary_note": "Changes apply immediately. The layout is saved to {path}. Display power applies to this session.",
+    "updated": "Updated at {time}",
+    "solo_all": "Enable all",
+    "screen_title": "Displays",
+    "preset_laptop": "Built-in only",
+    "preset_external": "External only",
+    "preset_dual": "Side by side",
+    "preset_need_two": "Connect both a built-in and an external display.",
+    "preset_need_builtin": "No built-in display detected.",
+    "preset_need_external": "No external display detected.",
+    "vrr": "Variable refresh rate",
+    "scale_range": "Scale (0.5×–3×)"
   },
   "settings": {
     "glyph": {
-      "label": "栏图标"
+      "label": "Bar icon"
     },
     "outputs_file": {
-      "description": "布局写回的文件，需要在 niri 的 config.kdl 里用 include 引入。",
-      "label": "布局输出文件"
+      "description": "Generated layout file. Include it in Niri's config.kdl to restore the layout.",
+      "label": "Layout file"
     },
     "refresh_interval": {
-      "description": "兜底轮询间隔。输出变化通常由 Noctalia 的输出事件立即触发，焦点变化是实时跟踪的。",
-      "label": "兜底刷新间隔（秒）"
+      "description": "How often to refresh as a fallback. Noctalia output events normally trigger updates.",
+      "label": "Fallback refresh interval (seconds)"
     },
     "scale_presets": {
-      "description": "分辨率变化后自动套用的缩放。全屏统一写 WIDTHxHEIGHT=SCALE，单端口写 PORT:WIDTHxHEIGHT=SCALE。例：1920x1080=1 · eDP-1:2560x1600=1.5",
-      "label": "分辨率缩放预设"
+      "description": "Automatically apply scales by resolution. Use WIDTHxHEIGHT=SCALE for all outputs or PORT:WIDTHxHEIGHT=SCALE for a specific one. Examples are 1920x1080=1 and eDP-1:2560x1600=1.5.",
+      "label": "Resolution scale presets"
     },
     "show_resolution": {
-      "description": "在栏图标旁显示当前聚焦输出的端口和分辨率，关掉就是纯图标。",
-      "label": "显示详情"
+      "description": "Show the focused output's connector and resolution beside the bar icon.",
+      "label": "Show display details"
     }
   },
-  "title": "显示器",
+  "title": "Displays",
   "shortcut": {
-    "label": "显示器",
+    "label": "Displays",
     "preset_cycle": {
-      "label": "屏幕布局"
+      "label": "Display layout"
     }
   }
 }

@@ -20,6 +20,7 @@ local presetApplying = {}
 -- also repairs a mode change that completed while the service was unavailable.
 local forcePresetCheck = true
 local startRefresh
+local presetOperation = nil
 
 local tr = noctalia.tr
 
@@ -44,7 +45,7 @@ end
 
 local function readFallbackIntervalSeconds()
   local seconds = tonumber(noctalia.getConfig("refresh_interval")) or DEFAULT_FALLBACK_INTERVAL_S
-  return math.max(MIN_FALLBACK_INTERVAL_S, seconds)
+  return math.clamp(seconds, MIN_FALLBACK_INTERVAL_S, 300)
 end
 
 local function quoteShellArgument(value)
@@ -92,8 +93,8 @@ local function presetFor(port, width, height)
 end
 
 local function displayLabel(output, connector)
-  local make = noctalia.string.trim(output.make or "")
-  local model = noctalia.string.trim(output.model or "")
+  local make = noctalia.string.trim(type(output.make) == "string" and output.make or "")
+  local model = noctalia.string.trim(type(output.model) == "string" and output.model or "")
   if make ~= "" and model ~= "" then
     return make .. " " .. model
   elseif model ~= "" then
@@ -106,20 +107,25 @@ end
 
 local function normalizeModes(rawModes)
   local modes = {}
-  for _, raw in ipairs(rawModes or {}) do
-    local width = tonumber(raw.width)
-    local height = tonumber(raw.height)
-    local refresh = tonumber(raw.refresh_rate)
-    if width ~= nil and height ~= nil and refresh ~= nil then
-      table.insert(modes, {
-        width = width,
-        height = height,
-        refresh_rate = refresh,
-        preferred = raw.is_preferred == true,
-      })
+  local byIndex = {}
+  for index, raw in ipairs(type(rawModes) == "table" and rawModes or {}) do
+    if type(raw) == "table" then
+      local width = tonumber(raw.width)
+      local height = tonumber(raw.height)
+      local refresh = tonumber(raw.refresh_rate)
+      if width and width > 0 and height and height > 0 and refresh and refresh > 0 then
+        local mode = {
+          width = width,
+          height = height,
+          refresh_rate = refresh,
+          preferred = raw.is_preferred == true,
+        }
+        table.insert(modes, mode)
+        byIndex[index - 1] = mode
+      end
     end
   end
-  return modes
+  return modes, byIndex
 end
 
 -- Map Niri's JSON transform names to the values accepted by
@@ -145,15 +151,24 @@ end
 -- 面板每次成功执行 niri 命令后会 bump `persist_requested`，服务刷新到最新快照
 -- 之后再把 layout 写成 KDL 片段。config.kdl 用 include 引入该文件。
 local DEFAULT_OUTPUTS_FILE = "~/.config/niri/outputs.kdl"
+local OUTPUTS_HEADER = "// 本文件由 Noctalia 插件 xendr1a/niri-displays 自动生成；改布局请用面板（右上角显示器图标）。"
+local AUTO_PRIMARY_MARKER = "// startup-primary: auto"
 local persistPending = false
-local primaryPort = nil
+local layoutCandidate = nil
 
 local function outputsFilePath()
   local configured = noctalia.getConfig("outputs_file")
   if type(configured) ~= "string" or noctalia.string.trim(configured) == "" then
     configured = DEFAULT_OUTPUTS_FILE
   end
-  return noctalia.expandPath(noctalia.string.trim(configured))
+  local path = noctalia.expandPath(noctalia.string.trim(configured))
+  if path:sub(1, 1) ~= "/" then
+    local directory = noctalia.pluginDir()
+    if directory then
+      return directory .. "/" .. path
+    end
+  end
+  return path
 end
 
 -- ── 连接行为策略 ────────────────────────────────────────────────────────────
@@ -166,6 +181,7 @@ local policy = {
 }
 local policyEpoch = nil      -- 当前这一轮「外接屏集合」；变化时才执行动作，避免抢回手动操作
 local forcePolicyApply = false
+local loadedPolicyPath = nil
 
 local function isBuiltinPort(port)
   return type(port) == "string"
@@ -188,7 +204,16 @@ local function publishPolicy()
 end
 
 local function loadPolicy()
-  local raw = noctalia.readFile(policyFilePath())
+  local path = policyFilePath()
+  if path == loadedPolicyPath then
+    return
+  end
+  forcePolicyApply = loadedPolicyPath ~= nil
+  loadedPolicyPath = path
+  policyEpoch = nil
+  policy.focus_external = true
+  policy.internal_off_with_external = false
+  local raw = noctalia.readFile(path)
   if type(raw) == "string" and raw ~= "" then
     local decoded = noctalia.json.decode(raw)
     if type(decoded) == "table" then
@@ -209,17 +234,18 @@ local function savePolicy()
     local ok, err = noctalia.writeFile(policyFilePath(), encoded .. "\n")
     if not ok then
       noctalia.log("niri-displays: policy write failed: " .. tostring(err))
+      noctalia.notify(tr("policy.failed"), tostring(err))
     end
   end
   publishPolicy()
 end
 
 -- 读回上次写出的文件：拿到主屏标记，并为当前关掉的输出保留上次的 mode/scale 等。
-local function readExistingBlocks()
+local function readExistingBlocks(text)
   local blocks = {}
-  local text = noctalia.readFile(outputsFilePath())
+  local firstPrimary = nil
   if type(text) ~= "string" then
-    return blocks
+    return blocks, firstPrimary
   end
   for port, bodyText in text:gmatch('output%s+"([^"]+)"%s*{([^}]*)}') do
     local block = {}
@@ -228,76 +254,92 @@ local function readExistingBlocks()
     block.transform = bodyText:match('transform%s+"([^"]+)"')
     block.x, block.y = bodyText:match('position%s+x%s*=%s*(-?%d+)%s+y%s*=%s*(-?%d+)')
     block.vrr = bodyText:find("variable-refresh-rate", 1, true) ~= nil
-    if bodyText:find("focus-at-startup", 1, true) ~= nil then
-      block.primary = true
-      -- 文件里可能同时标了外接屏和内置屏（先出现者优先级更高），主屏只认第一个。
-      if primaryPort == nil then
-        primaryPort = port
-      end
+    if firstPrimary == nil and bodyText:find("focus-at-startup", 1, true) ~= nil then
+      firstPrimary = port
     end
     blocks[port] = block
   end
-  return blocks
+  if text:find("\n" .. AUTO_PRIMARY_MARKER .. "\n", 1, true) then
+    firstPrimary = nil
+  end
+  return blocks, firstPrimary
+end
+
+local function layoutError(path, key, detail)
+  local message = path .. "\n" .. tr(key)
+  if detail ~= nil and detail ~= "" then
+    message = message .. "\n" .. detail
+  end
+  noctalia.log("niri-displays: " .. message)
+  noctalia.notify(tr("error.layout_write"), message)
+end
+
+local function managedLayout(text)
+  return type(text) == "string" and (not text:find("%S") or text:match("^[^\r\n]*") == OUTPUTS_HEADER)
+end
+
+local function loadPrimary()
+  local path = outputsFilePath()
+  if noctalia.state.get("primary_layout_path") == path then
+    return
+  end
+  local text = noctalia.readFile(path)
+  local savedPrimary = nil
+  if managedLayout(text) then
+    local _, primary = readExistingBlocks(text)
+    savedPrimary = primary
+  end
+  noctalia.state.set("primary_port", savedPrimary or "")
+  noctalia.state.set("primary_layout_path", path)
 end
 
 local function writeOutputsFile(snapshot)
-  if type(snapshot) ~= "table" or type(snapshot.displays) ~= "table" then
-    return false, "no snapshot"
+  if snapshot.status ~= "ok" or #snapshot.displays == 0 then
+    return
   end
-  local existing = readExistingBlocks()
+
+  local path = outputsFilePath()
+  local previous, readError = noctalia.readFile(path)
+  if previous == nil and noctalia.fileExists(path) then
+    layoutError(path, "error.layout_write", readError)
+    return
+  elseif previous ~= nil and not managedLayout(previous) then
+    layoutError(path, "error.layout_unmanaged")
+    return
+  end
+
+  local existing = readExistingBlocks(previous)
   local requestedPrimary = noctalia.state.get("primary_port")
-  if type(requestedPrimary) == "string" and requestedPrimary ~= "" then
-    primaryPort = requestedPrimary
-  end
+  local primaryPort = type(requestedPrimary) == "string" and requestedPrimary ~= "" and requestedPrimary or nil
 
   local lines = {
-    "// 本文件由 Noctalia 插件 xendr1a/niri-displays 自动生成；改布局请用面板（右上角显示器图标）。",
+    OUTPUTS_HEADER,
     "// 关闭(off)状态不会被写入，避免拔掉外接屏后一个可用的输出都没有。",
-    "// 开机焦点按 focus-at-startup 出现的先后决定：接了外接屏就落在它上面，没接就落在内置屏。",
-    "",
+    "// 开机焦点按 focus-at-startup 出现的先后决定。",
   }
+  if primaryPort == nil then
+    table.insert(lines, AUTO_PRIMARY_MARKER)
+  end
+  table.insert(lines, "")
 
-  -- focus-at-startup 的优先级由配置里的书写顺序决定（先出现者先赢，见 niri 文档
-  -- Configuration: Outputs），所以外接屏写在前面、内置屏写在后面：
-  --   两块都接着 → 外接屏；只接笔记本 → 内置屏。两块都不亮 → niri 自己按名字挑。
+  -- Niri 以文件顺序决定开机焦点。未指定主屏时，选一块外接屏优先，内置屏兜底。
   local focusFlags = {}
-  local preferredExternal = nil
-  if type(primaryPort) == "string" and primaryPort ~= "" and not isBuiltinPort(primaryPort) then
-    preferredExternal = primaryPort
-  elseif type(primaryPort) ~= "string" or primaryPort == "" then
-    -- 没设过主屏：默认挑一块外接屏，先把「接了显示器就开机落在外屏」变成默认行为。
+  if primaryPort == nil then
     for _, display in ipairs(snapshot.displays) do
-      if display.enabled and not isBuiltinPort(display.port) then
-        preferredExternal = display.port
+      if not isBuiltinPort(display.port) then
+        primaryPort = display.port
         break
       end
     end
-    if preferredExternal == nil then
-      for _, display in ipairs(snapshot.displays) do
-        if not isBuiltinPort(display.port) then
-          preferredExternal = display.port
-          break
-        end
-      end
-    end
   end
-  if preferredExternal ~= nil then
-    focusFlags[preferredExternal] = true
-    primaryPort = preferredExternal
+  if primaryPort ~= nil then
+    focusFlags[primaryPort] = true
   end
   for _, display in ipairs(snapshot.displays) do
     if isBuiltinPort(display.port) then
       focusFlags[display.port] = true
     end
   end
-  if preferredExternal == nil and type(primaryPort) == "string" and primaryPort ~= "" then
-    focusFlags[primaryPort] = true -- 用户把主屏钉在内置屏上
-  end
-  -- 把最终生效的主屏发布出去，面板的星标才能反映「服务自动选的外接屏」而不只是手点过的。
-  if type(primaryPort) == "string" and primaryPort ~= "" then
-    noctalia.state.set("primary_port", primaryPort)
-  end
-
   local entries = {}
   local seenPorts = {}
   for _, display in ipairs(snapshot.displays) do
@@ -305,6 +347,10 @@ local function writeOutputsFile(snapshot)
     seenPorts[port] = true
     local old = existing[port] or {}
     local live = display.enabled and display.width > 0 and display.height > 0
+    local vrr = old.vrr
+    if live then
+      vrr = display.vrr_enabled
+    end
     table.insert(entries, {
       port = port,
       mode = live
@@ -312,7 +358,7 @@ local function writeOutputsFile(snapshot)
         or old.mode,
       scale = live and formatScale(display.scale) or old.scale,
       transform = live and display.transform or old.transform,
-      vrr = live and display.vrr_enabled or old.vrr,
+      vrr = vrr,
       x = live and tostring(math.floor(display.x + 0.5)) or old.x,
       y = live and tostring(math.floor(display.y + 0.5)) or old.y,
     })
@@ -321,6 +367,9 @@ local function writeOutputsFile(snapshot)
   -- 不用重新调分辨率/缩放/位置。
   for port, old in pairs(existing) do
     if not seenPorts[port] then
+      if isBuiltinPort(port) then
+        focusFlags[port] = true
+      end
       table.insert(entries, {
         port = port,
         mode = old.mode,
@@ -333,10 +382,10 @@ local function writeOutputsFile(snapshot)
     end
   end
 
-  -- 外接屏在前、内置屏在后，保证 niri 取到的是「外接屏优先」那一条。
+  -- 主屏放在首位，其余内置屏作为开机焦点的兜底。
   table.sort(entries, function(a, b)
     local function rank(entry)
-      if entry.port == preferredExternal then
+      if entry.port == primaryPort then
         return 0
       elseif isBuiltinPort(entry.port) then
         return 1
@@ -352,8 +401,9 @@ local function writeOutputsFile(snapshot)
 
   for _, entry in ipairs(entries) do
     local port = entry.port
-    if entry.mode ~= nil or entry.transform ~= nil then
-      table.insert(lines, 'output "' .. port .. '" {')
+    if entry.mode ~= nil or entry.transform ~= nil or focusFlags[port] then
+      local escapedPort = port:gsub('[\\"]', '\\%0')
+      table.insert(lines, 'output "' .. escapedPort .. '" {')
       if entry.mode ~= nil then
         table.insert(lines, '    mode "' .. entry.mode .. '"')
       end
@@ -377,61 +427,89 @@ local function writeOutputsFile(snapshot)
     end
   end
 
-  local path = outputsFilePath()
   local content = table.concat(lines, "\n")
-  -- 先留一份上一版，写完立刻让 niri 校验整份配置；不合法就整份回滚，
-  -- 免得下次重载配置因为这一小段 KDL 直接失败。
-  local previous = noctalia.readFile(path)
-  if type(previous) == "string" and previous ~= "" then
-    noctalia.writeFile(path .. ".bak", previous)
+  if previous == content then
+    return
   end
 
-  local ok, err = noctalia.writeFile(path, content)
+  -- 校验同目录的临时文件，避免 niri 在校验前加载到未完成的布局。
+  local candidate = path .. string.format(".tmp-%.0f-%d", noctalia.nowMs(), math.random(100000, 999999))
+  local ok, err = noctalia.writeFile(candidate, content)
   if not ok then
-    noctalia.log("niri-displays: layout write failed: " .. tostring(err))
-    return false, err
+    noctalia.removeFile(candidate)
+    layoutError(path, "error.layout_write", err)
+    return
   end
 
-  local started = noctalia.runAsync("niri validate", function(result)
-    if result.exitCode == 0 then
-      noctalia.log("niri-displays: layout written + verified: " .. path)
+  local function finishLayoutWrite(key, detail)
+    noctalia.removeFile(candidate)
+    layoutCandidate = nil
+    if key ~= nil then
+      layoutError(path, key, detail)
+    end
+    if persistPending then
+      startRefresh()
+    end
+  end
+
+  layoutCandidate = candidate
+  local started = noctalia.runAsync({ "niri", "validate", "--config", candidate }, function(result)
+    if result.exitCode ~= 0 or result.timedOut then
+      local details = noctalia.string.trim(result.stderr or ""):match("^[^\r\n]*") or ""
+      finishLayoutWrite("error.layout_invalid", details)
       return
     end
-    local firstLine = noctalia.string.trim(result.stderr or ""):match("^[^\n]*") or ""
-    if type(previous) == "string" and previous ~= "" then
-      noctalia.writeFile(path, previous)
-      noctalia.log("niri-displays: niri rejected generated layout, rolled back: " .. firstLine)
-      noctalia.notify("显示器布局未写入", "niri 校验失败，已回滚上一版：" .. firstLine)
-    else
-      noctalia.log("niri-displays: niri rejected generated layout, no backup to restore: " .. firstLine)
-      noctalia.notify("显示器布局未写入", "niri 校验失败：" .. firstLine)
+    if outputsFilePath() ~= path or noctalia.readFile(path) ~= previous
+      or (previous == nil and noctalia.fileExists(path)) then
+      finishLayoutWrite("error.layout_changed")
+      return
     end
+    if persistPending or presetOperation or noctalia.state.get("display_action_pending") == true then
+      persistPending = true
+      finishLayoutWrite()
+      return
+    end
+    if previous ~= nil then
+      local backup = candidate .. ".bak"
+      local copied, backupError = noctalia.writeFile(backup, previous)
+      if copied then
+        copied, backupError = noctalia.renameFile(backup, path .. ".bak")
+      end
+      if not copied then
+        noctalia.removeFile(backup)
+        finishLayoutWrite("error.layout_write", backupError)
+        return
+      end
+    end
+
+    local replaced, replaceError = noctalia.renameFile(candidate, path)
+    if not replaced then
+      finishLayoutWrite("error.layout_write", replaceError)
+      return
+    end
+    noctalia.log("niri-displays: validated and saved layout: " .. path)
+    finishLayoutWrite()
   end, 8000)
 
   if not started then
-    noctalia.log("niri-displays: could not start niri validate")
+    finishLayoutWrite("error.layout_invalid", tr("error.command"))
   end
-
-  return true
 end
 
 local function normalizeOutputs(rawOutputs, focusedName, revision)
   local displays = {}
   for connector, raw in pairs(rawOutputs) do
-    if type(raw) == "table" then
-      local modes = normalizeModes(raw.modes)
+    if type(connector) == "string" and type(raw) == "table" then
+      local modes, modesByIndex = normalizeModes(raw.modes)
       local currentIndex = tonumber(raw.current_mode)
-      local currentMode = nil
-      if currentIndex ~= nil then
-        currentMode = modes[currentIndex + 1]
-      end
+      local currentMode = currentIndex and modesByIndex[currentIndex] or nil
       local logical = type(raw.logical) == "table" and raw.logical or nil
       table.insert(displays, {
         name = displayLabel(raw, connector),
         port = connector,
-        make = raw.make or "",
-        model = raw.model or "",
-        serial = raw.serial or "",
+        make = type(raw.make) == "string" and raw.make or "",
+        model = type(raw.model) == "string" and raw.model or "",
+        serial = type(raw.serial) == "string" and raw.serial or "",
         focused = connector == focusedName,
         enabled = logical ~= nil and currentMode ~= nil,
         x = logical and (tonumber(logical.x) or 0) or 0,
@@ -440,6 +518,8 @@ local function normalizeOutputs(rawOutputs, focusedName, revision)
         transform = logical and normalizeTransform(logical.transform) or "normal",
         width = currentMode and currentMode.width or 0,
         height = currentMode and currentMode.height or 0,
+        logical_width = logical and tonumber(logical.width) or nil,
+        logical_height = logical and tonumber(logical.height) or nil,
         refresh_rate = currentMode and currentMode.refresh_rate or 0,
         modes = modes,
         vrr_supported = raw.vrr_supported == true,
@@ -508,9 +588,8 @@ local function applyPresetsForResolutionChanges(snapshot)
             if result.exitCode ~= 0 then
               noctalia.log("niri-displays: automatic scale failed for " .. port .. ": "
                 .. commandError(result, tr("error.command")))
-            else
-              startRefresh()
             end
+            startRefresh()
           end, COMMAND_TIMEOUT_MS)
           if not started then
             presetApplying[port] = nil
@@ -551,11 +630,21 @@ end
 -- 只在「亮着的外接屏集合」变化时执行，所以之后手动打开内屏、或把焦点切回笔记本，
 -- 都不会被反复抢回去。开机时第一次快照算一次变化，于是「接着显示器开机」也能落在
 -- 外接屏上。
-local function applyConnectionPolicy(snapshot)
-  if type(snapshot) ~= "table" or type(snapshot.displays) ~= "table" then
-    return
+local policyCommandsPending = 0
+
+local function connectionPolicyKey(displays)
+  local ports = {}
+  for _, display in ipairs(displays) do
+    if display.enabled and not isBuiltinPort(display.port) then
+      table.insert(ports, display.port)
+    end
   end
-  if snapshot.status ~= "ok" then
+  table.sort(ports)
+  return table.concat(ports, ",")
+end
+
+local function applyConnectionPolicy(snapshot)
+  if policyCommandsPending > 0 or snapshot.status ~= "ok" then
     return
   end
 
@@ -573,7 +662,7 @@ local function applyConnectionPolicy(snapshot)
     end
   end
 
-  local key = table.concat(externals, ",")
+  local key = connectionPolicyKey(snapshot.displays)
   if key == policyEpoch and not forcePolicyApply then
     return
   end
@@ -587,35 +676,38 @@ local function applyConnectionPolicy(snapshot)
     if policy.internal_off_with_external and builtinPort ~= nil and builtinEnabled
       and enabledTotal > 1 then
       table.insert(commands, "niri msg output " .. quoteShellArgument(builtinPort) .. " off")
-      table.insert(labels, "关闭内置屏")
+      table.insert(labels, tr("policy.turn_internal_off"))
     elseif forced and not policy.internal_off_with_external and builtinPort ~= nil
       and not builtinEnabled then
       table.insert(commands, "niri msg output " .. quoteShellArgument(builtinPort) .. " on")
-      table.insert(labels, "打开内置屏")
+      table.insert(labels, tr("policy.turn_internal_on"))
     end
     if policy.focus_external and snapshot.focused_output ~= externals[1]
       and (snapshot.focused_output == nil or isBuiltinPort(snapshot.focused_output)) then
       table.insert(commands, "niri msg action focus-monitor " .. quoteShellArgument(externals[1]))
-      table.insert(labels, "焦点移到 " .. externals[1])
+      table.insert(labels, tr("policy.focus_output", { port = externals[1] }))
     end
   elseif policy.internal_off_with_external and builtinPort ~= nil and not builtinEnabled then
     -- 外接屏全拔了：把内屏开回来，别留一块黑屏
     table.insert(commands, "niri msg output " .. quoteShellArgument(builtinPort) .. " on")
-    table.insert(labels, "恢复内置屏")
+    table.insert(labels, tr("policy.restore_internal"))
   end
 
   for index, command in ipairs(commands) do
     local label = labels[index]
     noctalia.log("niri-displays: policy " .. label .. ": " .. command)
+    policyCommandsPending += 1
     local started = noctalia.runAsync(command, function(result)
+      policyCommandsPending -= 1
       if result.exitCode ~= 0 then
         local message = commandError(result, tr("error.command"))
         noctalia.log("niri-displays: policy command failed: " .. message)
-        noctalia.notify(tr("policy.failed"), label .. "失败：" .. message)
+        noctalia.notify(tr("policy.failed"), label .. "\n" .. message)
       end
       startRefresh()
     end, COMMAND_TIMEOUT_MS)
     if not started then
+      policyCommandsPending -= 1
       noctalia.log("niri-displays: could not start policy command: " .. command)
     end
   end
@@ -634,6 +726,10 @@ local function isRotatedSideways(transform)
 end
 
 local function logicalSizeOf(display)
+  if display.logical_width and display.logical_width > 0
+    and display.logical_height and display.logical_height > 0 then
+    return display.logical_width, display.logical_height
+  end
   local scale = display.scale > 0 and display.scale or 1
   local width = display.width / scale
   local height = display.height / scale
@@ -667,21 +763,23 @@ local function planNeighborMoves(displays)
   for _, display in ipairs(displays) do
     local port = display.port
     local newO = rects[port]
-    if port ~= changed and newO ~= nil then
-      local oldO = lastGeometryByPort[port] or newO
+    local oldO = lastGeometryByPort[port]
+    if port ~= changed and newO ~= nil and oldO ~= nil then
       local x, y = newO.x, newO.y
       local gapRight = oldO.x - (oldP.x + oldP.w)
       local gapLeft = oldP.x - (oldO.x + oldO.w)
       local gapBottom = oldO.y - (oldP.y + oldP.h)
       local gapTop = oldP.y - (oldO.y + oldO.h)
-      if gapRight >= -1 then
+      local verticalOverlap = oldO.y < oldP.y + oldP.h and oldP.y < oldO.y + oldO.h
+      local horizontalOverlap = oldO.x < oldP.x + oldP.w and oldP.x < oldO.x + oldO.w
+      if verticalOverlap and gapRight >= -1 then
         x = newP.x + newP.w + gapRight
-      elseif gapLeft >= -1 then
-        x = newP.x - oldO.w - gapLeft
-      elseif gapBottom >= -1 then
+      elseif verticalOverlap and gapLeft >= -1 then
+        x = newP.x - newO.w - gapLeft
+      elseif horizontalOverlap and gapBottom >= -1 then
         y = newP.y + newP.h + gapBottom
-      elseif gapTop >= -1 then
-        y = newP.y - oldO.h - gapTop
+      elseif horizontalOverlap and gapTop >= -1 then
+        y = newP.y - newO.h - gapTop
       end
       x, y = math.floor(x + 0.5), math.floor(y + 0.5)
       if math.abs(x - newO.x) > 0.5 or math.abs(y - newO.y) > 0.5 then
@@ -733,112 +831,189 @@ local function repositionNeighbors(displays)
   end
 end
 
--- ── 一键布局：IPC / 快捷入口共用的命令生成与执行 ────────────────────────────
--- 逻辑与面板按钮一致：缺内置屏或外接屏时直接报错，绝不生成「全关」命令。
-local function modeLogicalSize(display)
-  if display.enabled and display.width > 0 and display.height > 0 then
-    return logicalSizeOf(display)
-  end
-  local mode = nil
-  for _, candidate in ipairs(display.modes or {}) do
-    if candidate.preferred then
-      mode = candidate
-      break
-    end
-  end
-  mode = mode or (display.modes or {})[1]
-  if mode == nil then
-    return { width = 0, height = 0 }
-  end
-  local scale = display.scale > 0 and display.scale or 1
-  local width, height = mode.width / scale, mode.height / scale
-  if isRotatedSideways(display.transform) then
-    return { width = height, height = width }
-  end
-  return { width = width, height = height }
-end
-
-local function presetCommands(kind, displays)
+local function presetTargetPorts(kind, displays)
+  local ports = {}
   local external, builtin = nil, nil
   for _, display in ipairs(displays) do
-    if isBuiltinPort(display.port) then
-      builtin = builtin or display
+    local port = display.port
+    if isBuiltinPort(port) then
+      builtin = builtin or port
     else
-      external = external or display
+      external = external or port
+    end
+    if kind == "all" or isBuiltinPort(port) == (kind == "laptop") then
+      ports[port] = true
     end
   end
 
-  local commands = {}
   if kind == "dual" then
     if external == nil or builtin == nil then
       return nil, "panel.preset_need_two"
     end
-    local extSize = modeLogicalSize(external)
-    if not external.enabled then
-      table.insert(commands, "niri msg output " .. quoteShellArgument(external.port) .. " on")
+    return { [builtin] = true, [external] = true }
+  elseif kind == "laptop" and builtin == nil then
+    return nil, "panel.preset_need_builtin"
+  elseif kind == "external" and external == nil then
+    return nil, "panel.preset_need_external"
+  end
+  return ports
+end
+
+local function publishPresetStatus(pending, message)
+  noctalia.state.set("preset_status", { pending = pending, error_message = message or "" })
+  if message then
+    noctalia.notify(tr("error.preset_title"), message)
+  end
+end
+
+local function finishPreset(snapshot, message)
+  local operation = presetOperation
+  presetOperation = nil
+  if snapshot and not message then
+    -- The user chose this layout. Resume automatic policy at the next change.
+    policyEpoch = connectionPolicyKey(snapshot.displays)
+    if operation.kind == "dual" then
+      persistPending = true
     end
-    table.insert(commands, "niri msg output " .. quoteShellArgument(external.port) .. " position set -- 0 0")
-    if not builtin.enabled then
-      table.insert(commands, "niri msg output " .. quoteShellArgument(builtin.port) .. " on")
+  end
+  if snapshot and forcePolicyApply then
+    refreshQueued = true
+  end
+  publishPresetStatus(false, message)
+end
+
+local function requestPresetSnapshot(stage)
+  presetOperation.stage = stage
+  presetOperation.snapshotAfter = generation
+  startRefresh()
+end
+
+local function runPresetCommands(commands, stage)
+  presetOperation.stage = nil
+  local command = table.concat(commands, " && ")
+  noctalia.log("niri-displays: preset " .. presetOperation.kind .. ": " .. command)
+  local started = noctalia.runAsync(command, function(result)
+    if result.exitCode ~= 0 then
+      presetOperation.error_message = commandError(result, tr("error.command"))
     end
-    table.insert(commands, "niri msg output " .. quoteShellArgument(builtin.port)
-      .. " position set -- " .. tostring(math.floor(extSize.width + 0.5)) .. " 0")
-  elseif kind == "laptop" or kind == "external" then
-    local wantBuiltin = kind == "laptop"
-    if wantBuiltin and builtin == nil then
-      return nil, "panel.preset_need_builtin"
+    requestPresetSnapshot(stage)
+  end, COMMAND_TIMEOUT_MS)
+  if not started then
+    presetOperation.error_message = tr("error.command")
+    requestPresetSnapshot(stage)
+  end
+end
+
+local function presetCanAdvance(snapshot)
+  return presetOperation.stage ~= nil and snapshot.revision > presetOperation.snapshotAfter
+    and policyCommandsPending == 0 and not repositionBusy and next(presetApplying) == nil
+    and noctalia.state.get("display_action_pending") ~= true
+end
+
+local function retryPresetSnapshot()
+  if presetOperation.retries == 0 then
+    return false
+  end
+  presetOperation.retries -= 1
+  requestPresetSnapshot(presetOperation.stage)
+  return true
+end
+
+local function advancePreset(snapshot)
+  if not presetCanAdvance(snapshot) then
+    return
+  end
+  local operation = presetOperation
+  if operation.error_message then
+    finishPreset(snapshot, operation.error_message)
+    return
+  end
+
+  if operation.stage == "prepare" then
+    local ports, errorKey = presetTargetPorts(operation.kind, snapshot.displays)
+    if not ports then
+      finishPreset(snapshot, tr(errorKey))
+      return
     end
-    if not wantBuiltin and external == nil then
-      return nil, "panel.preset_need_external"
-    end
-    for _, display in ipairs(displays) do
-      local keep = isBuiltinPort(display.port) == wantBuiltin
-      if display.enabled ~= keep then
-        table.insert(commands, "niri msg output " .. quoteShellArgument(display.port) .. (keep and " on" or " off"))
+    operation.ports = ports
+    local enable = {}
+    for _, display in ipairs(snapshot.displays) do
+      if ports[display.port] and not display.enabled then
+        table.insert(enable, "niri msg output " .. quoteShellArgument(display.port) .. " on")
       end
     end
-  elseif kind == "all" then
-    for _, display in ipairs(displays) do
-      if not display.enabled then
-        table.insert(commands, "niri msg output " .. quoteShellArgument(display.port) .. " on")
+    if #enable > 0 then
+      operation.retries = 2
+      runPresetCommands(enable, "enabled")
+      return
+    end
+  end
+
+  local active = {}
+  local commands = {}
+  for _, display in ipairs(snapshot.displays) do
+    if display.enabled then
+      active[display.port] = display
+      if (operation.kind == "laptop" or operation.kind == "external")
+        and isBuiltinPort(display.port) ~= (operation.kind == "laptop") then
+        table.insert(commands, "niri msg output " .. quoteShellArgument(display.port) .. " off")
       end
+    end
+  end
+  for port in pairs(operation.ports) do
+    if not active[port] then
+      if not retryPresetSnapshot() then
+        finishPreset(snapshot, tr("error.preset_enable"))
+      end
+      return
+    end
+  end
+
+  if operation.kind == "dual" then
+    local builtin, external
+    for port in pairs(operation.ports) do
+      if isBuiltinPort(port) then
+        builtin = active[port]
+      else
+        external = active[port]
+      end
+    end
+    local logicalWidth = logicalSizeOf(external)
+    local width = math.floor(logicalWidth + 0.5)
+    if external.x ~= 0 or external.y ~= 0 or builtin.x ~= width or builtin.y ~= 0 then
+      table.insert(commands, "niri msg output " .. quoteShellArgument(external.port) .. " position set -- 0 0")
+      table.insert(commands, "niri msg output " .. quoteShellArgument(builtin.port)
+        .. " position set -- " .. tostring(width) .. " 0")
+    end
+  end
+
+  if #commands == 0 then
+    finishPreset(snapshot)
+  elseif operation.stage == "verify" then
+    if not retryPresetSnapshot() then
+      finishPreset(snapshot, tr("error.preset_incomplete"))
     end
   else
-    return nil, "panel.preset_need_two"
+    operation.retries = 2
+    runPresetCommands(commands, "verify")
   end
-  return commands
 end
 
 local function applyPreset(kind)
-  if type(kind) ~= "string" or kind == "" then
+  if presetOperation then
     return
   end
-  local snapshot = noctalia.state.get(STATE_KEY)
-  if type(snapshot) ~= "table" or type(snapshot.displays) ~= "table" then
+  if kind ~= "laptop" and kind ~= "external" and kind ~= "dual" and kind ~= "all" then
+    publishPresetStatus(false, tr("error.preset_unavailable"))
     return
   end
-  local commands, errKey = presetCommands(kind, snapshot.displays)
-  if commands == nil then
-    noctalia.notify(tr("policy.failed"), tr(errKey))
-    return
-  end
-  if #commands == 0 then
-    startRefresh()
-    return
-  end
-  local command = table.concat(commands, " && ")
-  noctalia.log("niri-displays: preset " .. kind .. ": " .. command)
-  local started = noctalia.runAsync(command, function(result)
-    if result.exitCode == 0 then
-      persistPending = true
-      startRefresh()
-    else
-      noctalia.notify(tr("policy.failed"), commandError(result, tr("error.command")))
-    end
-  end, COMMAND_TIMEOUT_MS)
-  if not started then
-    noctalia.notify(tr("policy.failed"), tr("error.command"))
-  end
+  presetOperation = { kind = kind, retries = 0 }
+  publishPresetStatus(true)
+  requestPresetSnapshot("prepare")
+end
+
+local function automaticActionsPending()
+  return policyCommandsPending > 0 or repositionBusy or next(presetApplying) ~= nil
 end
 
 startRefresh = function()
@@ -846,13 +1021,21 @@ startRefresh = function()
     refreshQueued = true
     return
   end
+  lastFullRefreshAt = tonumber(noctalia.formatTime("%s")) or 0
   if not noctalia.commandExists("niri") then
-    noctalia.state.set(STATE_KEY, initialSnapshot("error", tr("error.niri_missing")))
+    local message = tr("error.niri_missing")
+    local stale = shallowCopy(noctalia.state.get(STATE_KEY))
+    stale.status = "error"
+    stale.error_message = message
+    stale.actions_pending = automaticActionsPending()
+    noctalia.state.set(STATE_KEY, stale)
+    if presetOperation and presetOperation.stage then
+      finishPreset(nil, message)
+    end
     return
   end
 
   fetching = true
-  lastFullRefreshAt = tonumber(noctalia.formatTime("%s")) or 0
   generation += 1
   local thisGeneration = generation
   local pending = 2
@@ -874,24 +1057,43 @@ startRefresh = function()
       return
     end
 
-    fetching = false
     if rawOutputs == nil then
       local stale = shallowCopy(noctalia.state.get(STATE_KEY))
       stale.status = "error"
       stale.error_message = outputsError ~= "" and outputsError or tr("error.outputs")
+      stale.actions_pending = automaticActionsPending()
       noctalia.state.set(STATE_KEY, stale)
+      if not refreshQueued and presetOperation and presetOperation.stage then
+        finishPreset(nil, presetOperation.error_message or stale.error_message)
+      end
     else
       local nextSnapshot = normalizeOutputs(rawOutputs, focusedName, thisGeneration)
-      applyPresetsForResolutionChanges(nextSnapshot)
-      repositionNeighbors(nextSnapshot.displays)
+      local applyingPreset = presetOperation ~= nil
+      local panelBusy = noctalia.state.get("display_action_pending") == true
+      if not refreshQueued and not panelBusy then
+        if not applyingPreset or presetOperation.stage == "prepare" or presetOperation.stage == "enabled" then
+          applyPresetsForResolutionChanges(nextSnapshot)
+        end
+        if applyingPreset then
+          rememberGeometry(nextSnapshot.displays)
+          advancePreset(nextSnapshot)
+        elseif next(presetApplying) == nil then
+          repositionNeighbors(nextSnapshot.displays)
+          if not repositionBusy then
+            applyConnectionPolicy(nextSnapshot)
+          end
+        end
+      end
+      nextSnapshot.actions_pending = automaticActionsPending()
       noctalia.state.set(STATE_KEY, nextSnapshot)
-      if persistPending then
+      if persistPending and not refreshQueued and not panelBusy and not layoutCandidate
+        and not presetOperation and not nextSnapshot.actions_pending then
         persistPending = false
         writeOutputsFile(nextSnapshot)
       end
-      applyConnectionPolicy(nextSnapshot)
     end
 
+    fetching = false
     if refreshQueued then
       refreshQueued = false
       startRefresh()
@@ -957,6 +1159,12 @@ noctalia.state.watch("persist_requested", function(value)
   end
 end)
 
+noctalia.state.watch("display_action_pending", function(value)
+  if value == false then
+    startRefresh()
+  end
+end)
+
 -- 面板拨开关 → 这里落盘，并立刻重新跑一遍策略（force：即使外接屏集合没变也执行）。
 local lastPolicyNonce = tonumber(noctalia.state.get("policy_requested")) or 0
 noctalia.state.watch("policy_requested", function(value)
@@ -994,7 +1202,9 @@ noctalia.state.watch("preset_requested", function(value)
   end
 end)
 
+loadPrimary()
 loadPolicy()
+publishPresetStatus(false)
 noctalia.state.set(STATE_KEY, initialSnapshot("loading", ""))
 startRefresh()
 
@@ -1006,8 +1216,16 @@ function update()
 end
 
 function onConfigChanged()
+  loadPrimary()
+  loadPolicy()
   forcePresetCheck = true
   startRefresh()
+end
+
+function onExit()
+  if layoutCandidate then
+    noctalia.removeFile(layoutCandidate)
+  end
 end
 
 -- Native Noctalia service hook. Niri output mode, scale, and hotplug changes
@@ -1022,12 +1240,17 @@ function onIpc(event, payload)
   if event == "refresh" then
     startRefresh()
   elseif event == "save" then
-    writeOutputsFile(noctalia.state.get(STATE_KEY))
+    persistPending = true
+    startRefresh()
   elseif event == "primary" then
-    if type(payload) == "string" and payload ~= "" then
-      noctalia.state.set("primary_port", payload)
-      primaryPort = payload
-      writeOutputsFile(noctalia.state.get(STATE_KEY))
+    local snapshot = noctalia.state.get(STATE_KEY)
+    for _, display in ipairs(snapshot.displays) do
+      if display.port == payload then
+        noctalia.state.set("primary_port", payload)
+        persistPending = true
+        startRefresh()
+        break
+      end
     end
   elseif event == "policy" then
     -- 空 payload：打印当前策略；JSON payload：直接改（脚本化验证用，等价于面板拨开关）

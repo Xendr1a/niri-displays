@@ -29,7 +29,7 @@ local function render()
   end
 
   local focused = focusedDisplay()
-  local showDetails = noctalia.getConfig("show_resolution") ~= false
+  local showDetails = noctalia.getConfig("show_resolution") == true
   local children = {
     ui.glyph({
       name = glyph,
