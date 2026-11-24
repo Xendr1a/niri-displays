@@ -3,6 +3,7 @@
 -- 与面板按钮走同一条服务端链路：写 preset_kind + bump preset_requested。
 
 local snapshot = noctalia.state.get("display_snapshot") or { displays = {} }
+local presetStatus = noctalia.state.get("preset_status") or {}
 
 local function isBuiltinPort(port)
   return type(port) == "string"
@@ -27,6 +28,9 @@ local function collectState()
 end
 
 local function nextPreset()
+  if snapshot.status ~= "ok" or presetStatus.pending then
+    return nil
+  end
   local hasBuiltin, hasExternal, builtinEnabled, externalEnabled = collectState()
   local available = {}
   if hasBuiltin then
@@ -51,14 +55,12 @@ local function nextPreset()
     current = "external"
   end
 
-  local index = 1
   for i, kind in ipairs(available) do
     if kind == current then
-      index = i
-      break
+      return available[i % #available + 1]
     end
   end
-  return available[index % #available + 1]
+  return available[1]
 end
 
 local function render()
@@ -74,6 +76,11 @@ noctalia.state.watch("display_snapshot", function(value)
     snapshot = value
     render()
   end
+end)
+
+noctalia.state.watch("preset_status", function(value)
+  presetStatus = value or {}
+  render()
 end)
 
 render()
