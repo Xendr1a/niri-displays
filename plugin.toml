@@ -21,7 +21,7 @@ key = "refresh_interval"
 type = "int"
 label_key = "settings.refresh_interval.label"
 description_key = "settings.refresh_interval.description"
-default = 30
+default = 90
 min = 5
 max = 300
 
