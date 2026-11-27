@@ -3,9 +3,12 @@
 -- and publishes a normalized snapshot for the bar widget and panel.
 
 local STATE_KEY = "display_snapshot"
-local DEFAULT_FALLBACK_INTERVAL_S = 30
+-- 兜底轮询：onOutputsChanged 钩子是主路径（本机 2026-11-27 验证会触发），
+-- 轮询只负责兜底，默认 90s 以减少 niri 子进程；钩子不可靠的环境把 refresh_interval 设回 30。
+local DEFAULT_FALLBACK_INTERVAL_S = 90
 local MIN_FALLBACK_INTERVAL_S = 5
-local FOCUS_CHECK_INTERVAL_MS = 100
+-- 焦点变化 500ms 内被看到足够；100ms 时每秒 10 次唤醒没有可见收益。
+local FOCUS_CHECK_INTERVAL_MS = 500
 local COMMAND_TIMEOUT_MS = 5000
 
 local fetching = false
@@ -23,6 +26,17 @@ local startRefresh
 local presetOperation = nil
 
 local tr = noctalia.tr
+
+-- 单次 host 回调抛错不应带走整个 service：记日志后继续。
+-- 包裹 update / onIpc / 每个 runAsync 回调，异常只损失这一轮刷新。
+local function guarded(label, fn)
+  return function(...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+      noctalia.log("niri-displays: " .. label .. " failed: " .. tostring(err))
+    end
+  end
+end
 
 local function initialSnapshot(status, message)
   return {
@@ -453,7 +467,7 @@ local function writeOutputsFile(snapshot)
   end
 
   layoutCandidate = candidate
-  local started = noctalia.runAsync({ "niri", "validate", "--config", candidate }, function(result)
+  local started = noctalia.runAsync({ "niri", "validate", "--config", candidate }, guarded("validate-layout", function(result)
     if result.exitCode ~= 0 or result.timedOut then
       local details = noctalia.string.trim(result.stderr or ""):match("^[^\r\n]*") or ""
       finishLayoutWrite("error.layout_invalid", details)
@@ -489,7 +503,7 @@ local function writeOutputsFile(snapshot)
     end
     noctalia.log("niri-displays: validated and saved layout: " .. path)
     finishLayoutWrite()
-  end, 8000)
+  end), 8000)
 
   if not started then
     finishLayoutWrite("error.layout_invalid", tr("error.command"))
@@ -583,14 +597,14 @@ local function applyPresetsForResolutionChanges(snapshot)
             .. " scale " .. quoteShellArgument(formatScale(targetScale))
           noctalia.log("niri-displays: resolution changed on " .. port .. " to " .. resolution
             .. "; applying scale preset " .. formatScale(targetScale))
-          local started = noctalia.runAsync(command, function(result)
+          local started = noctalia.runAsync(command, guarded("auto-scale", function(result)
             presetApplying[port] = nil
             if result.exitCode ~= 0 then
               noctalia.log("niri-displays: automatic scale failed for " .. port .. ": "
                 .. commandError(result, tr("error.command")))
             end
             startRefresh()
-          end, COMMAND_TIMEOUT_MS)
+          end), COMMAND_TIMEOUT_MS)
           if not started then
             presetApplying[port] = nil
             noctalia.log("niri-displays: could not start automatic scale command for " .. port)
@@ -697,7 +711,7 @@ local function applyConnectionPolicy(snapshot)
     local label = labels[index]
     noctalia.log("niri-displays: policy " .. label .. ": " .. command)
     policyCommandsPending += 1
-    local started = noctalia.runAsync(command, function(result)
+    local started = noctalia.runAsync(command, guarded("connection-policy", function(result)
       policyCommandsPending -= 1
       if result.exitCode ~= 0 then
         local message = commandError(result, tr("error.command"))
@@ -705,7 +719,7 @@ local function applyConnectionPolicy(snapshot)
         noctalia.notify(tr("policy.failed"), label .. "\n" .. message)
       end
       startRefresh()
-    end, COMMAND_TIMEOUT_MS)
+    end), COMMAND_TIMEOUT_MS)
     if not started then
       policyCommandsPending -= 1
       noctalia.log("niri-displays: could not start policy command: " .. command)
@@ -816,7 +830,7 @@ local function repositionNeighbors(displays)
       .. " to " .. move.x .. "," .. move.y)
   end
   repositionBusy = true
-  local started = noctalia.runAsync(table.concat(parts, " && "), function(result)
+  local started = noctalia.runAsync(table.concat(parts, " && "), guarded("adjacency-move", function(result)
     repositionBusy = false
     if result.exitCode ~= 0 then
       noctalia.log("niri-displays: adjacency move failed: "
@@ -825,7 +839,7 @@ local function repositionNeighbors(displays)
       persistPending = true
     end
     startRefresh()
-  end, COMMAND_TIMEOUT_MS)
+  end), COMMAND_TIMEOUT_MS)
   if not started then
     repositionBusy = false
   end
@@ -892,12 +906,12 @@ local function runPresetCommands(commands, stage)
   presetOperation.stage = nil
   local command = table.concat(commands, " && ")
   noctalia.log("niri-displays: preset " .. presetOperation.kind .. ": " .. command)
-  local started = noctalia.runAsync(command, function(result)
+  local started = noctalia.runAsync(command, guarded("preset-command", function(result)
     if result.exitCode ~= 0 then
       presetOperation.error_message = commandError(result, tr("error.command"))
     end
     requestPresetSnapshot(stage)
-  end, COMMAND_TIMEOUT_MS)
+  end), COMMAND_TIMEOUT_MS)
   if not started then
     presetOperation.error_message = tr("error.command")
     requestPresetSnapshot(stage)
@@ -1038,9 +1052,13 @@ startRefresh = function()
   fetching = true
   generation += 1
   local thisGeneration = generation
-  local pending = 2
+  local pending = 1
   local rawOutputs = nil
-  local focusedName = nil
+  -- 焦点不用再起一个 niri 子进程：宿主 API 已维护当前焦点输出（与 syncFocusedOutput 同源）。
+  local focusedName = noctalia.focusedOutputName()
+  if type(focusedName) ~= "string" or focusedName == "" then
+    focusedName = nil
+  end
   local outputsError = ""
 
   local previous = shallowCopy(noctalia.state.get(STATE_KEY))
@@ -1100,7 +1118,7 @@ startRefresh = function()
     end
   end
 
-  local outputsStarted = noctalia.runAsync("niri msg --json outputs", function(result)
+  local outputsStarted = noctalia.runAsync("niri msg --json outputs", guarded("refresh.outputs", function(result)
     if thisGeneration ~= generation then
       return
     end
@@ -1115,25 +1133,9 @@ startRefresh = function()
       outputsError = commandError(result, tr("error.outputs"))
     end
     completeOne()
-  end, COMMAND_TIMEOUT_MS)
+  end), COMMAND_TIMEOUT_MS)
   if not outputsStarted then
     outputsError = tr("error.outputs")
-    completeOne()
-  end
-
-  local focusStarted = noctalia.runAsync("niri msg --json focused-output", function(result)
-    if thisGeneration ~= generation then
-      return
-    end
-    if result.exitCode == 0 and not result.stdoutTruncated then
-      local decoded = noctalia.json.decode(result.stdout or "")
-      if type(decoded) == "table" and type(decoded.name) == "string" then
-        focusedName = decoded.name
-      end
-    end
-    completeOne()
-  end, COMMAND_TIMEOUT_MS)
-  if not focusStarted then
     completeOne()
   end
 end
@@ -1208,11 +1210,17 @@ publishPresetStatus(false)
 noctalia.state.set(STATE_KEY, initialSnapshot("loading", ""))
 startRefresh()
 
-function update()
+local function updateTick()
   syncFocusedOutput()
   if (tonumber(noctalia.formatTime("%s")) or 0) - lastFullRefreshAt >= readFallbackIntervalSeconds() then
     startRefresh()
   end
+end
+
+local updateGuarded = guarded("update", updateTick)
+
+function update()
+  updateGuarded()
 end
 
 function onConfigChanged()
@@ -1236,7 +1244,7 @@ function onOutputsChanged()
   startRefresh()
 end
 
-function onIpc(event, payload)
+local function ipcHandler(event, payload)
   if event == "refresh" then
     startRefresh()
   elseif event == "save" then
@@ -1282,4 +1290,10 @@ function onIpc(event, payload)
     local snapshot = noctalia.state.get(STATE_KEY)
     noctalia.log("niri-displays: " .. (noctalia.json.encode(snapshot) or "?"))
   end
+end
+
+local ipcGuarded = guarded("ipc", ipcHandler)
+
+function onIpc(event, payload)
+  ipcGuarded(event, payload)
 end

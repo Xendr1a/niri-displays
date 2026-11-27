@@ -75,7 +75,10 @@ local tr = noctalia.tr
 local function canChangeDisplays(current, currentPreset)
   current = current or snapshot
   currentPreset = currentPreset or presetStatus
-  return current.status == "ok" and not current.actions_pending and not actionPending and not currentPreset.pending
+  -- refreshing 只是后台在取快照：若把它当忙，面板每轮刷新都会闪灰、期间的点击被吞。
+  -- 只在首屏加载（loading/error）或真正的动作/预设进行中禁用。
+  local ready = current.status == "ok" or current.status == "refreshing"
+  return ready and not current.actions_pending and not actionPending and not currentPreset.pending
 end
 
 local function quoteShellArgument(value)
