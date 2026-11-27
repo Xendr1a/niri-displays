@@ -1052,9 +1052,13 @@ startRefresh = function()
   fetching = true
   generation += 1
   local thisGeneration = generation
-  local pending = 2
+  local pending = 1
   local rawOutputs = nil
-  local focusedName = nil
+  -- 焦点不用再起一个 niri 子进程：宿主 API 已维护当前焦点输出（与 syncFocusedOutput 同源）。
+  local focusedName = noctalia.focusedOutputName()
+  if type(focusedName) ~= "string" or focusedName == "" then
+    focusedName = nil
+  end
   local outputsError = ""
 
   local previous = shallowCopy(noctalia.state.get(STATE_KEY))
@@ -1132,22 +1136,6 @@ startRefresh = function()
   end), COMMAND_TIMEOUT_MS)
   if not outputsStarted then
     outputsError = tr("error.outputs")
-    completeOne()
-  end
-
-  local focusStarted = noctalia.runAsync("niri msg --json focused-output", guarded("refresh.focus", function(result)
-    if thisGeneration ~= generation then
-      return
-    end
-    if result.exitCode == 0 and not result.stdoutTruncated then
-      local decoded = noctalia.json.decode(result.stdout or "")
-      if type(decoded) == "table" and type(decoded.name) == "string" then
-        focusedName = decoded.name
-      end
-    end
-    completeOne()
-  end), COMMAND_TIMEOUT_MS)
-  if not focusStarted then
     completeOne()
   end
 end

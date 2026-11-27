@@ -28,7 +28,8 @@ local function collectState()
 end
 
 local function nextPreset()
-  if snapshot.status ~= "ok" or presetStatus.pending then
+  -- refreshing 不算忙：只有首屏加载/出错或预设进行中才禁用瓷砖，否则每轮刷新都会闪灰。
+  if (snapshot.status ~= "ok" and snapshot.status ~= "refreshing") or presetStatus.pending then
     return nil
   end
   local hasBuiltin, hasExternal, builtinEnabled, externalEnabled = collectState()
